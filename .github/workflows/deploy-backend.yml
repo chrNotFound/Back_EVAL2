@@ -1,0 +1,149 @@
+# ============================================================
+# .github/workflows/deploy-backend.yml
+#
+# Pipeline CI/CD - Backend Node.js + MySQL
+# Trigger: push a la rama "deploy"
+#
+# Flujo: build imagen → push a Docker Hub → deploy en EC2
+# ============================================================
+
+name: CI/CD Backend - Innovatech
+
+on:
+  push:
+    branches:
+      - deploy          # Se activa SOLO con push a la rama deploy
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/innovatech-backend
+  CONTAINER_NAME: innovatech-backend
+
+jobs:
+
+  # ----------------------------------------------------------
+  # JOB 1: Build y Push de la imagen Docker
+  # ----------------------------------------------------------
+  build-and-push:
+    name: Build & Push imagen Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout del código fuente
+      - name: Checkout código fuente
+        uses: actions/checkout@v4
+
+      # 2. Configurar Docker Buildx
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Login en Docker Hub
+      - name: Login en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4. Extraer metadatos para tagging
+      - name: Extraer metadatos de la imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      # 5. Build y Push (multi-stage Dockerfile)
+      - name: Build y Push imagen Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          dockerfile: Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ----------------------------------------------------------
+  # JOB 2: Deploy en instancia EC2 Backend
+  # ----------------------------------------------------------
+  deploy-to-ec2:
+    name: Deploy en EC2 Backend
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout código fuente
+        uses: actions/checkout@v4
+
+      - name: Deploy en EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_BACKEND_HOST }}        # IP privada de EC2 Backend
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            # ---- Variables de entorno ----
+            export IMAGE_NAME="${{ env.IMAGE_NAME }}"
+            export CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
+            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            export DOCKERHUB_TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
+
+            # ---- Login en Docker Hub desde EC2 ----
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            # ---- Descargar imagen más reciente ----
+            docker pull ${IMAGE_NAME}:latest
+
+            # ---- Detener y eliminar contenedor anterior ----
+            docker stop $CONTAINER_NAME   2>/dev/null || true
+            docker rm $CONTAINER_NAME     2>/dev/null || true
+
+            # ---- Asegurar que la red existe (para comunicación con MySQL) ----
+            docker network create innovatech-backend-network 2>/dev/null || true
+
+            # ---- Asegurar que el volumen de MySQL existe ----
+            docker volume create innovatech-mysql-data 2>/dev/null || true
+
+            # ---- Levantar/Actualizar MySQL si no está corriendo ----
+            if ! docker ps --format '{{.Names}}' | grep -q "innovatech-mysql"; then
+              docker run -d \
+                --name innovatech-mysql \
+                --restart unless-stopped \
+                --network innovatech-backend-network \
+                -e MYSQL_ROOT_PASSWORD="${{ secrets.MYSQL_ROOT_PASSWORD }}" \
+                -e MYSQL_DATABASE="${{ secrets.DB_NAME }}" \
+                -e MYSQL_USER="${{ secrets.DB_USER }}" \
+                -e MYSQL_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+                -v innovatech-mysql-data:/var/lib/mysql \
+                mysql:8.0
+              echo "⏳ Esperando que MySQL esté listo..."
+              sleep 30
+            fi
+
+            # ---- Iniciar contenedor del Backend ----
+            docker run -d \
+              --name $CONTAINER_NAME \
+              --restart unless-stopped \
+              --network innovatech-backend-network \
+              -p 3000:3000 \
+              -e PORT=3000 \
+              -e NODE_ENV=production \
+              -e DB_HOST=innovatech-mysql \
+              -e DB_PORT=3306 \
+              -e DB_NAME="${{ secrets.DB_NAME }}" \
+              -e DB_USER="${{ secrets.DB_USER }}" \
+              -e DB_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+              ${IMAGE_NAME}:latest
+
+            # ---- Verificar estado del contenedor ----
+            sleep 10
+            docker ps --filter "name=$CONTAINER_NAME" --format "{{.Status}}"
+
+            # ---- Limpiar imágenes antiguas ----
+            docker image prune -f
+
+            echo "✅ Deploy backend completado exitosamente"

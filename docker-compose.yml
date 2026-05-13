@@ -1,0 +1,107 @@
+version: "3.9"
+
+# ============================================================
+# docker-compose.yml - BACKEND
+# Levanta el backend Node.js junto con la base de datos MySQL.
+# En producción (EC2 backend), el frontend se conecta
+# mediante la IP privada de esta instancia.
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # Servicio: Backend Node.js / Express
+  # ----------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: innovatech-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_NAME=${DB_NAME:-proyecto_db}
+      - DB_USER=${DB_USER:-app_user}
+      - DB_PASSWORD=${DB_PASSWORD}
+    env_file:
+      - .env
+    networks:
+      - backend-network
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:3000/api/usuarios',(r)=>r.statusCode<500?process.exit(0):process.exit(1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ----------------------------------------------------------
+  # Servicio: Base de datos MySQL 8.0
+  # ----------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: innovatech-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME:-proyecto_db}
+      MYSQL_USER: ${DB_USER:-app_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    # Puerto solo expuesto dentro de la red interna de Docker.
+    # NO se mapea al host en producción por seguridad.
+    expose:
+      - "3306"
+    volumes:
+      # -------------------------------------------------------
+      # Named volume para persistencia de datos MySQL
+      # Justificación de elección (named volume vs bind mount):
+      #
+      # Named volume (ELEGIDO):
+      #   + Docker gestiona ubicación y ciclo de vida
+      #   + Portabilidad: funciona igual en cualquier host
+      #   + Mayor rendimiento I/O en Linux
+      #   + No expone rutas internas del servidor host
+      #   + Respaldable con `docker run --volumes-from`
+      #
+      # Bind mount (NO elegido):
+      #   - Depende de la estructura de directorios del host
+      #   - Problemas de permisos entre host y contenedor
+      #   - Menor portabilidad entre entornos
+      # -------------------------------------------------------
+      - mysql-data:/var/lib/mysql
+      # Script SQL de inicialización (solo se ejecuta si BD vacía)
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "root", "--password=${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+# ============================================================
+# Redes internas (solo accesibles entre contenedores del stack)
+# ============================================================
+networks:
+  backend-network:
+    driver: bridge
+    name: innovatech-backend-network
+
+# ============================================================
+# Volúmenes con nombre (named volumes)
+# ============================================================
+volumes:
+  mysql-data:
+    driver: local
+    name: innovatech-mysql-data
